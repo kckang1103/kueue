@@ -11215,11 +11215,70 @@ func TestStop(t *testing.T) {
 		stopReason        jobframework.StopReason
 		eventMsg          string
 		deleteBeforePatch bool
+		stopPolicy        jobframework.PreemptionStopPolicy
+		evictionErr       error
 		wantPatched       bool
 		wantDeleted       bool
+		wantEvicted       bool
 		wantStopped       []client.Object
 		wantErr           error
 	}{
+		"evicts instead of deleting a pod stopped by preemption": {
+			pod: testingpod.MakePod("pod", metav1.NamespaceDefault).
+				ResourceVersion("1").
+				Obj(),
+			stopReason:  jobframework.StopReasonWorkloadEvictedByPreemption,
+			stopPolicy:  jobframework.PreemptionStopPolicyEvict,
+			wantPatched: true,
+			wantEvicted: true,
+			wantStopped: []client.Object{
+				testingpod.MakePod("pod", metav1.NamespaceDefault).
+					ResourceVersion("1").
+					Obj(),
+			},
+		},
+		"reports a pod whose eviction a PodDisruptionBudget refused": {
+			pod: testingpod.MakePod("pod", metav1.NamespaceDefault).
+				ResourceVersion("1").
+				Obj(),
+			stopReason:  jobframework.StopReasonWorkloadEvictedByPreemption,
+			stopPolicy:  jobframework.PreemptionStopPolicyEvict,
+			evictionErr: apierrors.NewTooManyRequests("Cannot evict pod as it would violate the pod's disruption budget.", 0),
+			wantPatched: true,
+			wantEvicted: true,
+			wantStopped: []client.Object{},
+			wantErr: &jobframework.ErrDisruptionBlocked{
+				Pods: []client.ObjectKey{{Namespace: metav1.NamespaceDefault, Name: "pod"}},
+			},
+		},
+		"deletes a pod evicted for a reason other than preemption under the evict policy": {
+			pod: testingpod.MakePod("pod", metav1.NamespaceDefault).
+				ResourceVersion("1").
+				Obj(),
+			stopReason:  jobframework.StopReasonWorkloadEvicted,
+			stopPolicy:  jobframework.PreemptionStopPolicyEvict,
+			wantPatched: true,
+			wantDeleted: true,
+			wantStopped: []client.Object{
+				testingpod.MakePod("pod", metav1.NamespaceDefault).
+					ResourceVersion("1").
+					Obj(),
+			},
+		},
+		"deletes a pod stopped by preemption under the delete policy": {
+			pod: testingpod.MakePod("pod", metav1.NamespaceDefault).
+				ResourceVersion("1").
+				Obj(),
+			stopReason:  jobframework.StopReasonWorkloadEvictedByPreemption,
+			stopPolicy:  jobframework.PreemptionStopPolicyDelete,
+			wantPatched: true,
+			wantDeleted: true,
+			wantStopped: []client.Object{
+				testingpod.MakePod("pod", metav1.NamespaceDefault).
+					ResourceVersion("1").
+					Obj(),
+			},
+		},
 		"the pod isn’t being deleted": {
 			pod: testingpod.MakePod("pod", metav1.NamespaceDefault).
 				ResourceVersion("1").
@@ -11257,7 +11316,7 @@ func TestStop(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			ctx, _ := utiltesting.ContextWithLog(t)
 
-			var patched, deleted bool
+			var patched, deleted, evicted bool
 
 			kcBuilder := utiltesting.NewClientBuilder().
 				WithObjects(tc.pod).
@@ -11279,6 +11338,16 @@ func TestStop(t *testing.T) {
 						deleted = true
 						return c.Delete(ctx, obj, opts...)
 					},
+					SubResourceCreate: func(ctx context.Context, c client.Client, subResourceName string, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error {
+						if subResourceName != "eviction" {
+							return c.SubResource(subResourceName).Create(ctx, obj, subResource, opts...)
+						}
+						evicted = true
+						if tc.evictionErr != nil {
+							return tc.evictionErr
+						}
+						return c.Delete(ctx, obj)
+					},
 				})
 			kClient := kcBuilder.Build()
 
@@ -11287,7 +11356,7 @@ func TestStop(t *testing.T) {
 				clock: fakeClock,
 			}
 
-			stopped, err := p.Stop(ctx, kClient, nil, tc.stopReason, tc.eventMsg)
+			stopped, err := p.Stop(jobframework.WithPreemptionStopPolicy(ctx, tc.stopPolicy), kClient, nil, tc.stopReason, tc.eventMsg)
 
 			if diff := cmp.Diff(tc.wantPatched, patched); diff != "" {
 				t.Errorf("patched mismatch (-want +got):\n%s", diff)
@@ -11297,11 +11366,22 @@ func TestStop(t *testing.T) {
 				t.Errorf("deleted mismatch (-want +got):\n%s", diff)
 			}
 
+			if diff := cmp.Diff(tc.wantEvicted, evicted); diff != "" {
+				t.Errorf("evicted mismatch (-want +got):\n%s", diff)
+			}
+
 			if diff := cmp.Diff(tc.wantStopped, stopped); diff != "" {
 				t.Errorf("stopped mismatch (-want +got):\n%s", diff)
 			}
 
-			if diff := cmp.Diff(tc.wantErr, err, cmpopts.EquateErrors()); diff != "" {
+			var wantBlocked, gotBlocked *jobframework.ErrDisruptionBlocked
+			if errors.As(tc.wantErr, &wantBlocked) {
+				if !errors.As(err, &gotBlocked) {
+					t.Errorf("error = %v, want %v", err, tc.wantErr)
+				} else if diff := cmp.Diff(wantBlocked, gotBlocked); diff != "" {
+					t.Errorf("ErrDisruptionBlocked mismatch (-want +got):\n%s", diff)
+				}
+			} else if diff := cmp.Diff(tc.wantErr, err, cmpopts.EquateErrors()); diff != "" {
 				t.Errorf("error mismatch (-want +got):\n%s", diff)
 			}
 		})

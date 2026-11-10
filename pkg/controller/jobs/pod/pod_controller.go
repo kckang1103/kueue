@@ -29,6 +29,7 @@ import (
 	"github.com/go-logr/logr"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -610,6 +611,12 @@ func (p *Pod) Stop(ctx context.Context, c client.Client, _ []podset.PodSetInfo, 
 		podsInGroup = []corev1.Pod{p.pod}
 	}
 
+	// KEP-5273: evict Pods stopped by preemption, so PodDisruptionBudgets are honored. The
+	// reconciler only asks for this until a refusal has lasted the eviction timeout.
+	evict := stopReason == jobframework.StopReasonWorkloadEvictedByPreemption &&
+		jobframework.PreemptionStopPolicyFrom(ctx) == jobframework.PreemptionStopPolicyEvict
+	var refused []client.ObjectKey
+
 	stoppedNow := make([]client.Object, 0)
 	for i := range podsInGroup {
 		if !podsInGroup[i].DeletionTimestamp.IsZero() {
@@ -646,7 +653,19 @@ func (p *Pod) Stop(ctx context.Context, c client.Client, _ []podset.PodSetInfo, 
 
 		// Delete the pod if it is not already deleted.
 		if err == nil {
-			if err := c.Delete(ctx, podInGroup.Object()); client.IgnoreNotFound(err) != nil {
+			if evict {
+				err := c.SubResource("eviction").Create(ctx, podInGroup.Object(), &policyv1.Eviction{
+					ObjectMeta: metav1.ObjectMeta{Name: podInGroup.pod.Name, Namespace: podInGroup.pod.Namespace},
+				})
+				if apierrors.IsTooManyRequests(err) {
+					// A PodDisruptionBudget refused. The pod keeps running; the reconciler retries.
+					refused = append(refused, client.ObjectKeyFromObject(podInGroup.Object()))
+					continue
+				}
+				if client.IgnoreNotFound(err) != nil {
+					return stoppedNow, err
+				}
+			} else if err := c.Delete(ctx, podInGroup.Object()); client.IgnoreNotFound(err) != nil {
 				return stoppedNow, err
 			}
 			if p.shouldFinalizeNow(&podInGroup.pod, stopReason) {
@@ -659,6 +678,9 @@ func (p *Pod) Stop(ctx context.Context, c client.Client, _ []podset.PodSetInfo, 
 		stoppedNow = append(stoppedNow, podInGroup.Object())
 	}
 
+	if len(refused) > 0 {
+		return stoppedNow, &jobframework.ErrDisruptionBlocked{Pods: refused}
+	}
 	return stoppedNow, nil
 }
 

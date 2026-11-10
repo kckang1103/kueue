@@ -746,7 +746,13 @@ func (r *JobReconciler) reconcileEvicted(ctx context.Context, job GenericJob, wl
 	if evCond := apimeta.FindStatusCondition(wl.Status.Conditions, kueue.WorkloadEvicted); evCond != nil && evCond.Status == metav1.ConditionTrue {
 		log := ctrl.LoggerFrom(ctx)
 		log.V(3).Info("Handling a job with evicted condition")
-		if err := r.stopJob(ctx, job, wl, StopReasonWorkloadEvicted, evCond.Message); err != nil {
+		stopCtx := WithPreemptionStopPolicy(ctx, preemptionStopPolicyFor(wl, r.clock.Now(), DefaultPreemptionEvictionTimeout))
+		if err := r.stopJob(stopCtx, job, wl, StopReasonWorkloadEvicted, evCond.Message); err != nil {
+			var blockedErr *ErrDisruptionBlocked
+			if errors.As(err, &blockedErr) {
+				result, err := r.handleDisruptionBlocked(ctx, job, wl, blockedErr)
+				return true, result, err
+			}
 			return true, ctrl.Result{}, err
 		}
 		if !job.IsActive() {
@@ -893,6 +899,37 @@ func (r *JobReconciler) hasLiveManagedOwner(ctx context.Context, wl *kueue.Workl
 	}
 
 	return false, nil
+}
+
+// handleDisruptionBlocked records that a PodDisruptionBudget refused to evict some of wl's Pods and
+// requeues to retry. The first refusal sets DisruptionBlocked, and its LastTransitionTime is where
+// the eviction timeout counts from; later refusals leave the condition alone. The quota
+// reservation is kept: the refused Pods are still running, so job.IsActive() stays true.
+func (r *JobReconciler) handleDisruptionBlocked(ctx context.Context, job GenericJob, wl *kueue.Workload, blockedErr *ErrDisruptionBlocked) (ctrl.Result, error) {
+	log := ctrl.LoggerFrom(ctx)
+	now := r.clock.Now()
+	blocked := apimeta.FindStatusCondition(wl.Status.Conditions, kueue.WorkloadDisruptionBlocked)
+	if blocked == nil || blocked.Status != metav1.ConditionTrue {
+		log.V(2).Info("Eviction refused by a PodDisruptionBudget, retrying", "pods", blockedErr.Pods)
+		err := workloadpatching.PatchStatus(ctx, r.client, wl,
+			client.FieldOwner(fmt.Sprintf("%s-%s-controller", constants.KueueName, strings.ToLower(job.GVK().Kind))),
+			func(wl *kueue.Workload) (bool, error) {
+				return apimeta.SetStatusCondition(&wl.Status.Conditions, metav1.Condition{
+					Type:               kueue.WorkloadDisruptionBlocked,
+					Status:             metav1.ConditionTrue,
+					Reason:             "EvictionRefused",
+					Message:            api.TruncateConditionMessage(blockedErr.Error()),
+					LastTransitionTime: metav1.NewTime(now),
+				}), nil
+			})
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("setting %s condition: %w", kueue.WorkloadDisruptionBlocked, err)
+		}
+		r.record.Eventf(job.Object(), nil, corev1.EventTypeWarning, "DisruptionBlocked", "Stopped",
+			api.TruncateEventMessage(blockedErr.Error()))
+		return ctrl.Result{RequeueAfter: disruptionBlockedMinBackoff}, nil
+	}
+	return ctrl.Result{RequeueAfter: disruptionBlockedBackoff(now.Sub(blocked.LastTransitionTime.Time))}, nil
 }
 
 func (r *JobReconciler) clearAdmissionAfterEviction(ctx context.Context, job GenericJob, wl *kueue.Workload) error {

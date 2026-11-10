@@ -473,6 +473,12 @@
     lockToDefault: false
     preRelease: Beta
     version: "0.21"
+- name: PreemptionRespectsPodDisruptionBudgets
+  versionedSpecs:
+  - default: false
+    lockToDefault: false
+    preRelease: Alpha
+    version: "0.21"
 - name: PrioritizePreemptorWorkloads
   versionedSpecs:
   - default: false

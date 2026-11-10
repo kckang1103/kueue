@@ -1079,6 +1079,12 @@ const (
 	// WorkloadRequeued means that the Workload was requeued due to eviction.
 	WorkloadRequeued = "Requeued"
 
+	// WorkloadDisruptionBlocked means that stopping the Pods of a Workload evicted
+	// by preemption was refused by a PodDisruptionBudget. The condition's
+	// lastTransitionTime is when the refusals started. Set only when the
+	// PreemptionRespectsPodDisruptionBudgets feature gate is enabled.
+	WorkloadDisruptionBlocked = "DisruptionBlocked"
+
 	// WorkloadDeactivationTarget means that the Workload should be deactivated.
 	// This condition is temporary, so it should be removed after deactivation.
 	WorkloadDeactivationTarget = "DeactivationTarget"

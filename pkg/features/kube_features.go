@@ -979,6 +979,14 @@ const (
 	// alphabetical domain names, so smaller or partially-occupied parent
 	// domains are packed before splitting larger intact ancestor blocks.
 	TASAncestorCapacityTieBreak featuregate.Feature = "TASAncestorCapacityTieBreak"
+
+	// owner: TBD
+	// kep: https://github.com/kubernetes-sigs/kueue/tree/main/keps/5273-pdb-aware-preemption
+	//
+	// When enabled, the Pod integration stops the Pods of a Workload evicted by
+	// preemption through the eviction subresource, so PodDisruptionBudgets are
+	// honored, and deletes them only after a refusal has lasted the eviction timeout.
+	PreemptionRespectsPodDisruptionBudgets featuregate.Feature = "PreemptionRespectsPodDisruptionBudgets"
 )
 
 func init() {
@@ -1523,6 +1531,10 @@ var defaultVersionedFeatureGates = map[featuregate.Feature]featuregate.Versioned
 
 	TASAncestorCapacityTieBreak: {
 		{Version: version.MustParse("0.21"), Default: true, PreRelease: featuregate.Beta},
+	},
+
+	PreemptionRespectsPodDisruptionBudgets: {
+		{Version: version.MustParse("0.21"), Default: false, PreRelease: featuregate.Alpha},
 	},
 }
 
